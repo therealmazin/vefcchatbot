@@ -33,8 +33,8 @@ yarn-error.log*
 # env files (can opt-in for committing if needed)
 .env*
 
-# vector store cache
-.vectorstore-cache.json
+# vector store cache (included for Vercel deployment)
+# .vectorstore-cache.json
 
 # Knowledge Base files (keep private)
 /KB/
