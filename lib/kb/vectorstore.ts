@@ -52,6 +52,43 @@ class SimpleVectorStore {
     );
   }
 
+  // Keyword-based search (fallback for serverless environments)
+  keywordSearch(query: string, k: number = 5): Document[] {
+    const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 2);
+
+    const scored = this.entries.map((entry) => {
+      const content = entry.content.toLowerCase();
+      let score = 0;
+
+      for (const term of queryTerms) {
+        // Count occurrences of each term
+        const matches = content.split(term).length - 1;
+        score += matches;
+
+        // Bonus for exact phrase match
+        if (content.includes(query.toLowerCase())) {
+          score += 10;
+        }
+      }
+
+      return { entry, score };
+    });
+
+    // Sort by score (descending)
+    scored.sort((a, b) => b.score - a.score);
+
+    // Return top k results with score > 0
+    return scored
+      .filter((item) => item.score > 0)
+      .slice(0, k)
+      .map((item) =>
+        new Document({
+          pageContent: item.entry.content,
+          metadata: item.entry.metadata,
+        })
+      );
+  }
+
   getEntries(): VectorEntry[] {
     return this.entries;
   }
@@ -82,14 +119,27 @@ let vectorStoreInstance: SimpleVectorStore | null = null;
 // Embedding model instance (lazy loaded)
 let embeddingPipeline: unknown = null;
 
+// Flag to track if we're in a serverless environment where transformers won't work
+let useKeywordFallback = false;
+
 /**
  * Get the embedding pipeline (lazy loaded)
  */
 async function getEmbeddingPipeline() {
+  if (useKeywordFallback) {
+    return null;
+  }
+
   if (!embeddingPipeline) {
-    console.log("Loading embedding model (first time may take a moment)...");
-    const { pipeline } = await import("@xenova/transformers");
-    embeddingPipeline = await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2");
+    try {
+      console.log("Loading embedding model (first time may take a moment)...");
+      const { pipeline } = await import("@xenova/transformers");
+      embeddingPipeline = await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2");
+    } catch (error) {
+      console.warn("Failed to load embedding model, using keyword search fallback:", error);
+      useKeywordFallback = true;
+      return null;
+    }
   }
   return embeddingPipeline;
 }
@@ -97,8 +147,13 @@ async function getEmbeddingPipeline() {
 /**
  * Generate embeddings for texts
  */
-async function generateEmbeddings(texts: string[]): Promise<number[][]> {
+async function generateEmbeddings(texts: string[]): Promise<number[][] | null> {
   const pipe = await getEmbeddingPipeline();
+
+  if (!pipe) {
+    return null; // Will use keyword fallback
+  }
+
   const embeddings: number[][] = [];
 
   for (const text of texts) {
@@ -121,6 +176,10 @@ export async function createVectorStore(docs: Document[]): Promise<SimpleVectorS
   console.log("Generating embeddings (this may take a few minutes on first run)...");
   const texts = splitDocs.map((doc) => doc.pageContent);
   const embeddings = await generateEmbeddings(texts);
+
+  if (!embeddings) {
+    throw new Error("Failed to generate embeddings. Cannot create vector store.");
+  }
 
   console.log("Creating vector store...");
   const store = new SimpleVectorStore();
@@ -185,11 +244,22 @@ export async function getVectorStore(): Promise<SimpleVectorStore> {
 
 /**
  * Query the vector store for relevant documents
+ * Uses embedding similarity if available, falls back to keyword search
  */
 export async function queryVectorStore(query: string, k: number = 5): Promise<Document[]> {
   const store = await getVectorStore();
-  const [queryEmbedding] = await generateEmbeddings([query]);
-  return store.similaritySearch(queryEmbedding, k);
+
+  // Try embedding-based search first
+  const queryEmbedding = await generateEmbeddings([query]);
+
+  if (queryEmbedding && queryEmbedding[0]) {
+    console.log("Using embedding-based search");
+    return store.similaritySearch(queryEmbedding[0], k);
+  }
+
+  // Fallback to keyword search (for serverless environments)
+  console.log("Using keyword-based search (fallback)");
+  return store.keywordSearch(query, k);
 }
 
 export { textSplitter, generateEmbeddings, SimpleVectorStore };
